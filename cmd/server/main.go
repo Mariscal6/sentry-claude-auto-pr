@@ -10,10 +10,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/maris/sentryagent/internal/agent"
-	"github.com/maris/sentryagent/internal/config"
-	"github.com/maris/sentryagent/internal/gitprovider"
-	"github.com/maris/sentryagent/internal/webhook"
+	"github.com/Mariscal6/sentry-claude-auto-pr/internal/agent"
+	"github.com/Mariscal6/sentry-claude-auto-pr/internal/config"
+	"github.com/Mariscal6/sentry-claude-auto-pr/internal/gitprovider"
+	"github.com/Mariscal6/sentry-claude-auto-pr/internal/webhook"
 )
 
 func main() {

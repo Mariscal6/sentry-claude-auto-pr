@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/maris/sentryagent/internal/gitprovider"
-	"github.com/maris/sentryagent/internal/tools"
-	"github.com/maris/sentryagent/internal/webhook"
+	"github.com/Mariscal6/sentry-claude-auto-pr/internal/gitprovider"
+	"github.com/Mariscal6/sentry-claude-auto-pr/internal/tools"
+	"github.com/Mariscal6/sentry-claude-auto-pr/internal/webhook"
 )
 
 // Pipeline orchestrates the error analysis and fix generation using Claude Code.
