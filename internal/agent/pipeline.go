@@ -1,0 +1,214 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/maris/sentryagent/internal/gitprovider"
+	"github.com/maris/sentryagent/internal/tools"
+	"github.com/maris/sentryagent/internal/webhook"
+)
+
+// Pipeline orchestrates the error analysis and fix generation using Claude Code.
+type Pipeline struct {
+	anthropicAPIKey string
+}
+
+// NewPipeline creates a new agent pipeline.
+func NewPipeline(anthropicAPIKey string) *Pipeline {
+	return &Pipeline{
+		anthropicAPIKey: anthropicAPIKey,
+	}
+}
+
+// ProposedFix represents the output from the fix generation.
+type ProposedFix struct {
+	Files       []FileChange `json:"files"`
+	Description string       `json:"description"`
+	PRTitle     string       `json:"pr_title"`
+	PRBody      string       `json:"pr_body"`
+}
+
+// FileChange represents a file modification.
+type FileChange struct {
+	Path       string `json:"path"`
+	Content    string `json:"content"`
+	ChangeType string `json:"change_type"`
+}
+
+// Run executes the pipeline for an error using Claude Code.
+func (p *Pipeline) Run(ctx context.Context, repoURL, token string, parsedError *webhook.ParsedError) (*ProposedFix, error) {
+	log.Printf("Starting fix generation for issue %s", parsedError.IssueID)
+
+	// Clone the repository
+	log.Printf("Cloning repository: %s", repoURL)
+	repoDir, cleanup, err := tools.CloneRepo(ctx, repoURL, token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to clone repo: %w", err)
+	}
+	defer cleanup()
+
+	log.Printf("Repository cloned to: %s", repoDir)
+
+	// Create Claude Code tool
+	claudeCode := tools.NewClaudeCodeTool(repoDir, p.anthropicAPIKey)
+
+	// Build the fix request from parsed error
+	req := &tools.FixRequest{
+		IssueID:      parsedError.IssueID,
+		Title:        parsedError.Title,
+		ErrorType:    parsedError.ErrorType,
+		ErrorMessage: parsedError.ErrorMessage,
+		Level:        parsedError.Level,
+		Platform:     parsedError.Platform,
+		Culprit:      parsedError.Culprit,
+		Permalink:    parsedError.Permalink,
+		Stacktrace:   convertFrames(parsedError.Frames),
+	}
+
+	// Run Claude Code to generate the fix
+	log.Printf("Running Claude Code to analyze and fix the error...")
+	resp, err := claudeCode.GenerateFix(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("Claude Code error: %w", err)
+	}
+
+	if !resp.Success {
+		return nil, fmt.Errorf("Claude Code could not generate fix: %s", resp.Error)
+	}
+
+	log.Printf("Claude Code generated fix with %d file changes", len(resp.Files))
+
+	// Convert response to ProposedFix
+	fix := &ProposedFix{
+		Description: resp.Description,
+		PRTitle:     resp.PRTitle,
+		PRBody:      resp.PRBody,
+		Files:       make([]FileChange, len(resp.Files)),
+	}
+
+	for i, f := range resp.Files {
+		fix.Files[i] = FileChange{
+			Path:       f.Path,
+			Content:    f.Content,
+			ChangeType: f.ChangeType,
+		}
+	}
+
+	return fix, nil
+}
+
+// convertFrames converts webhook frames to tool frames.
+func convertFrames(webhookFrames []webhook.Frame) []tools.Frame {
+	frames := make([]tools.Frame, len(webhookFrames))
+	for i, f := range webhookFrames {
+		frames[i] = tools.Frame{
+			Filename: f.Filename,
+			Function: f.Function,
+			LineNo:   f.LineNo,
+			ColNo:    f.ColNo,
+			InApp:    f.InApp,
+			Module:   f.Module,
+		}
+	}
+	return frames
+}
+
+// CreatePullRequest creates a GitHub PR with the proposed fix.
+func CreatePullRequest(ctx context.Context, provider gitprovider.Provider, parsedError *webhook.ParsedError, fix *ProposedFix) (string, error) {
+	// Get default branch
+	defaultBranch, err := provider.GetDefaultBranch(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get default branch: %w", err)
+	}
+
+	// Get latest commit SHA
+	baseSHA, err := provider.GetLatestCommitSHA(ctx, defaultBranch)
+	if err != nil {
+		return "", fmt.Errorf("failed to get latest commit: %w", err)
+	}
+
+	// Create fix branch
+	branchName := fmt.Sprintf("sentry-fix/%s-%d", sanitizeBranchName(parsedError.ErrorType), unixTimestamp())
+	if err := provider.CreateBranch(ctx, branchName, baseSHA); err != nil {
+		return "", fmt.Errorf("failed to create branch: %w", err)
+	}
+
+	// Prepare file changes (only modified/created files)
+	var fileChanges []gitprovider.FileChange
+	for _, f := range fix.Files {
+		if f.ChangeType == "delete" {
+			continue // TODO: Handle deletions
+		}
+		fileChanges = append(fileChanges, gitprovider.FileChange{
+			Path:    f.Path,
+			Content: f.Content,
+		})
+	}
+
+	if len(fileChanges) == 0 {
+		return "", fmt.Errorf("no file changes to commit")
+	}
+
+	// Commit the changes
+	commitMsg := fmt.Sprintf("fix: %s\n\nFixes Sentry issue: %s\n\n%s",
+		fix.PRTitle, parsedError.Permalink, fix.Description)
+	_, err = provider.CommitFiles(ctx, branchName, fileChanges, commitMsg)
+	if err != nil {
+		return "", fmt.Errorf("failed to commit files: %w", err)
+	}
+
+	// Create pull request
+	prBody := fix.PRBody
+	if prBody == "" {
+		prBody = fmt.Sprintf("## Summary\n\n%s", fix.Description)
+	}
+	prBody += fmt.Sprintf("\n\n---\n🔗 Sentry Issue: %s\n🤖 Generated by SentryAgent using Claude Code", parsedError.Permalink)
+
+	prResp, err := provider.CreatePullRequest(ctx, gitprovider.PRRequest{
+		Title:  fix.PRTitle,
+		Body:   prBody,
+		Head:   branchName,
+		Base:   defaultBranch,
+		Labels: []string{"sentry", "auto-fix", "claude-code"},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to create PR: %w", err)
+	}
+
+	return prResp.HTMLURL, nil
+}
+
+// sanitizeBranchName makes a string safe for use in branch names.
+func sanitizeBranchName(s string) string {
+	s = strings.ToLower(s)
+	result := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			result = append(result, c)
+		} else if c == ' ' || c == '/' || c == ':' || c == '-' || c == '_' {
+			if len(result) > 0 && result[len(result)-1] != '-' {
+				result = append(result, '-')
+			}
+		}
+	}
+	// Trim trailing hyphens
+	for len(result) > 0 && result[len(result)-1] == '-' {
+		result = result[:len(result)-1]
+	}
+	if len(result) > 50 {
+		result = result[:50]
+	}
+	if len(result) == 0 {
+		return "fix"
+	}
+	return string(result)
+}
+
+func unixTimestamp() int64 {
+	return time.Now().Unix()
+}
